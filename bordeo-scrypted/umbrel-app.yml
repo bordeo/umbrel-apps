@@ -32,6 +32,8 @@ submitter: bordeo
 submission: https://github.com/bordeo/umbrel-apps
 repo: https://github.com/koush/scrypted
 support: https://github.com/koush/scrypted/issues
+gallery:
+  - https://raw.githubusercontent.com/bordeo/umbrel-apps/main/gallery/bordeo-scrypted/1.png
 dependencies: []
 path: ""
 defaultUsername: ""
