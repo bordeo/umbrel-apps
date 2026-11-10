@@ -40,10 +40,14 @@ services:
     image: koush/scrypted:v0.147.0-noble-full@sha256:e78b4fcecdd6c61acaaf22b50ccef303c738da58cc0be57afdb116521df52296
     restart: unless-stopped
     network_mode: host
-    # logging is noisy and will unnecessarily wear on flash storage.
-    # scrypted has per device in memory logging that is preferred.
+    # Upstream uses driver "none" to spare flash storage. Umbrel runs on SSD/NVMe,
+    # so keep small rotated logs (max 20 MB) for `docker logs` / Umbrel's log view.
+    # Scrypted's per-device logs in the UI remain the main source.
     logging:
-      driver: "none"
+      driver: "local"
+      options:
+        max-size: "10m"
+        max-file: "2"
     environment:
       # HTTP/HTTPS UI ports. 11080 matches denny-scrypted / upstream defaults.
       # Manifest port 21080 is reserved for app_proxy (see header comment).
