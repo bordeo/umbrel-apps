@@ -1,0 +1,44 @@
+manifestVersion: 1
+id: bordeo-scrypted
+name: Scrypted
+tagline: High-performance NVR and HomeKit video bridge
+icon: https://www.scrypted.app/img/logo.png
+category: automation
+version: "0.147.0"
+port: 21080
+description: >-
+  Scrypted is a high-performance home video integration platform and NVR with
+  smart detections. It provides low-latency streaming to HomeKit, Google Home,
+  and Alexa, and supports most IP cameras.
+
+
+  This Umbrel package runs Scrypted with Docker host networking so HomeKit
+  pairing and mDNS discovery work on your LAN. The HomeKit plugin uses its
+  default Ciao mDNS advertiser; host avahi does not need to be stopped, and
+  Scrypted's bundled Avahi (SCRYPTED_DOCKER_AVAHI) is left disabled.
+
+
+  The web UI listens on host port 11080 (HTTP) and 10443 (HTTPS). Umbrel's
+  Open button uses port 21080 via app_proxy so it does not collide with
+  Scrypted's own host bind. You can also open http://<umbrel-host>:11080
+  directly.
+
+
+  Updates are managed through Umbrel / this app store — Watchtower and the
+  Docker socket are not mounted.
+developer: ClockworkMod
+website: https://www.scrypted.app/
+submitter: bordeo
+submission: https://github.com/bordeo/umbrel-apps
+repo: https://github.com/koush/scrypted
+support: https://github.com/koush/scrypted/issues
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+torOnly: false
+releaseNotes: >-
+  Initial Bordeo packaging of Scrypted v0.147.0 (koush/scrypted
+  v0.147.0-noble-full). Host networking for HomeKit/mDNS, Ciao advertiser
+  (no host avahi changes), volume layout compatible with denny-scrypted
+  migration, and Umbrel-managed updates (no Watchtower / Docker socket).

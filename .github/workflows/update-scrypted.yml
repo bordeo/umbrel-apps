@@ -1,0 +1,341 @@
+name: Update Scrypted
+
+on:
+  schedule:
+    # Daily ~06:17 UTC
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      cooldown_days:
+        description: "Minimum age in days before proposing a release"
+        required: false
+        default: "4"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-scrypted
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find eligible Scrypted release
+        id: find
+        env:
+          COOLDOWN_DAYS: ${{ inputs.cooldown_days || '4' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, re, sys, urllib.request
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+
+          COOLDOWN_DAYS = int(os.environ.get("COOLDOWN_DAYS") or "4")
+          COMPOSE = Path("bordeo-scrypted/docker-compose.yml")
+          MANIFEST = Path("bordeo-scrypted/umbrel-app.yml")
+          compose_text = COMPOSE.read_text()
+
+          m = re.search(
+              r"image:\s*koush/scrypted:(?P<tag>v[\w.-]+?)@(?P<digest>sha256:[a-f0-9]+)",
+              compose_text,
+          )
+          if not m:
+              print("Could not parse current image pin from docker-compose.yml", file=sys.stderr)
+              sys.exit(1)
+
+          current_tag = m.group("tag")
+          current_digest = m.group("digest")
+          flavour_m = re.search(r"-(jammy|noble)-full$", current_tag)
+          if not flavour_m:
+              print(f"Unsupported current tag flavour: {current_tag}", file=sys.stderr)
+              sys.exit(1)
+          flavour = f"-{flavour_m.group(1)}-full"
+          # Prefer noble-full when scanning if we are already on noble; stay on same flavour.
+          tag_re = re.compile(rf"^v(\d+)\.(\d+)\.(\d+){re.escape(flavour)}$")
+
+          def parse_version(tag: str):
+              mm = tag_re.match(tag)
+              if not mm:
+                  return None
+              return tuple(int(x) for x in mm.groups())
+
+          current_version = parse_version(current_tag)
+          if current_version is None:
+              print(f"Current tag does not match expected flavour pattern: {current_tag}", file=sys.stderr)
+              sys.exit(1)
+
+          def http_json(url: str, headers=None):
+              req = urllib.request.Request(url, headers=headers or {})
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  return json.load(resp)
+
+          # Docker Hub: paginate tags for this flavour (substring filter)
+          hub_tags = []
+          flavour_query = flavour.lstrip("-")  # e.g. noble-full
+          url = (
+              "https://hub.docker.com/v2/repositories/koush/scrypted/tags"
+              f"?page_size=100&ordering=-last_updated&name={flavour_query}"
+          )
+          pages = 0
+          while url and pages < 20:
+              pages += 1
+              data = http_json(url)
+              for t in data.get("results") or []:
+                  name = t.get("name") or ""
+                  if not tag_re.match(name):
+                      continue
+                  if "beta" in name.lower():
+                      continue
+                  digest = t.get("digest")
+                  last_updated = t.get("last_updated")
+                  if not digest or not last_updated:
+                      continue
+                  hub_tags.append(
+                      {
+                          "tag": name,
+                          "digest": digest,
+                          "last_updated": last_updated,
+                          "version": parse_version(name),
+                      }
+                  )
+              url = data.get("next")
+
+          # GitHub releases (stable only) for published_at cross-check
+          gh_headers = {
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "bordeo-umbrel-apps-update-scrypted",
+          }
+          token = os.environ.get("GH_TOKEN")
+          if token:
+              gh_headers["Authorization"] = f"Bearer {token}"
+
+          gh_by_version = {}
+          page = 1
+          while page <= 5:
+              releases = http_json(
+                  f"https://api.github.com/repos/koush/scrypted/releases?per_page=100&page={page}",
+                  headers=gh_headers,
+              )
+              if not releases:
+                  break
+              for r in releases:
+                  if r.get("prerelease") or r.get("draft"):
+                      continue
+                  # GitHub tags look like v0.147.0
+                  raw = (r.get("tag_name") or "").strip()
+                  ver_key = raw[1:] if raw.startswith("v") else raw
+                  if not re.match(r"^\d+\.\d+\.\d+$", ver_key):
+                      continue
+                  published = r.get("published_at")
+                  if published:
+                      gh_by_version[ver_key] = {
+                          "published_at": published,
+                          "docker_tag": f"v{ver_key}{flavour}",
+                          "html_url": r.get("html_url"),
+                          "body": r.get("body") or "",
+                      }
+              if len(releases) < 100:
+                  break
+              page += 1
+
+          now = datetime.now(timezone.utc)
+          cooldown = timedelta(days=COOLDOWN_DAYS)
+
+          def parse_ts(s: str) -> datetime:
+              # Docker Hub / GitHub use ISO8601 with Z
+              return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+          eligible = []
+          for t in hub_tags:
+              if t["version"] is None or t["version"] <= current_version:
+                  continue
+              ver_key = ".".join(str(x) for x in t["version"])
+              gh = gh_by_version.get(ver_key)
+              # Age: require Docker Hub last_updated aged; if GH release exists, also require that aged
+              hub_age_ok = now - parse_ts(t["last_updated"]) >= cooldown
+              if not hub_age_ok:
+                  continue
+              if gh:
+                  if now - parse_ts(gh["published_at"]) < cooldown:
+                      continue
+              eligible.append({**t, "gh": gh, "ver_key": ver_key})
+
+          out = os.environ["GITHUB_OUTPUT"]
+
+          def write_out(name, value):
+              with open(out, "a", encoding="utf-8") as fh:
+                  value = str(value)
+                  if "\n" in value:
+                      fh.write(f"{name}<<EOF\n{value}\nEOF\n")
+                  else:
+                      fh.write(f"{name}={value}\n")
+
+          print(f"Current: {current_tag}@{current_digest}")
+          print(f"Flavour: {flavour}; cooldown_days={COOLDOWN_DAYS}")
+          print(f"Hub matching tags considered: {len(hub_tags)}; eligible after cooldown: {len(eligible)}")
+
+          if not eligible:
+              write_out("should_update", "false")
+              print("No eligible update.")
+              sys.exit(0)
+
+          best = sorted(eligible, key=lambda x: x["version"], reverse=True)[0]
+          notes = ""
+          if best.get("gh") and best["gh"].get("body"):
+              # Keep release notes short for umbrel-app.yml
+              body = best["gh"]["body"].strip().replace("\r\n", "\n")
+              notes = "\n".join(body.splitlines()[:40])
+          if not notes:
+              notes = (
+                  f"Scrypted {best['ver_key']} ({best['tag']}). "
+                  f"Image digest {best['digest']}."
+              )
+
+          write_out("should_update", "true")
+          write_out("current_tag", current_tag)
+          write_out("new_tag", best["tag"])
+          write_out("new_digest", best["digest"])
+          write_out("new_version", best["ver_key"])
+          write_out("release_notes", notes)
+          print(f"Selected: {best['tag']}@{best['digest']} (hub={best['last_updated']})")
+          PY
+
+      - name: Open bump PR
+        if: steps.find.outputs.should_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ steps.find.outputs.new_tag }}
+          NEW_DIGEST: ${{ steps.find.outputs.new_digest }}
+          NEW_VERSION: ${{ steps.find.outputs.new_version }}
+          CURRENT_TAG: ${{ steps.find.outputs.current_tag }}
+          RELEASE_NOTES: ${{ steps.find.outputs.release_notes }}
+          COOLDOWN_DAYS: ${{ inputs.cooldown_days || '4' }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/scrypted-${NEW_VERSION}"
+
+          # Skip if a PR/branch for this version already exists
+          if gh pr list --state all --search "head:${BRANCH}" --json number --jq 'length' | grep -vq '^0$'; then
+            echo "PR branch already exists for ${BRANCH}; skipping."
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Remote branch ${BRANCH} already exists; skipping."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          python3 <<'PY'
+          import os, re
+          from pathlib import Path
+          from datetime import date
+
+          new_tag = os.environ["NEW_TAG"]
+          new_digest = os.environ["NEW_DIGEST"]
+          new_version = os.environ["NEW_VERSION"]
+          notes = os.environ.get("RELEASE_NOTES", "").strip()
+
+          compose = Path("bordeo-scrypted/docker-compose.yml")
+          text = compose.read_text()
+          text2, n = re.subn(
+              r"image:\s*koush/scrypted:v[\w.-]+@sha256:[a-f0-9]+",
+              f"image: koush/scrypted:{new_tag}@{new_digest}",
+              text,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit(f"Expected to replace 1 image pin, got {n}")
+          compose.write_text(text2)
+
+          manifest = Path("bordeo-scrypted/umbrel-app.yml")
+          mtext = manifest.read_text()
+          mtext, n = re.subn(
+              r'^version:\s*".*"$',
+              f'version: "{new_version}"',
+              mtext,
+              count=1,
+              flags=re.M,
+          )
+          if n != 1:
+              raise SystemExit(f"Expected to replace 1 version field, got {n}")
+
+          # Replace releaseNotes block (folded scalar until next top-level key)
+          rn = (
+              f"Scrypted {new_version} ({new_tag}).\n\n"
+              f"{notes}\n"
+          )
+          # Escape for YAML folded block: keep as literal folded via >-
+          # Use a literal block for simplicity
+          def indent(s, prefix="  "):
+              return "\n".join(prefix + line if line else "" for line in s.splitlines())
+
+          new_rn = "releaseNotes: |-\n" + indent(rn)
+          mtext2, n = re.subn(
+              r"releaseNotes:\s*>-?\s*\n(?:[ \t].*\n|\n)*",
+              new_rn + "\n",
+              mtext,
+              count=1,
+          )
+          if n != 1:
+              # try |- form already
+              mtext2, n = re.subn(
+                  r"releaseNotes:\s*\|-?\s*\n(?:[ \t].*\n|\n)*",
+                  new_rn + "\n",
+                  mtext,
+                  count=1,
+              )
+          if n != 1:
+              raise SystemExit("Could not replace releaseNotes")
+          manifest.write_text(mtext2)
+
+          readme = Path("README.md")
+          r = readme.read_text()
+          r2 = re.sub(
+              r"`koush/scrypted:v[\w.-]+`",
+              f"`koush/scrypted:{new_tag}`",
+              r,
+              count=1,
+          )
+          readme.write_text(r2)
+          print("Files updated")
+          PY
+
+          git add bordeo-scrypted/docker-compose.yml bordeo-scrypted/umbrel-app.yml README.md
+          git commit -m "chore(scrypted): bump to ${NEW_VERSION} (${NEW_TAG})"
+          git push -u origin "$BRANCH"
+
+          BODY=$(cat <<EOF
+          ## Scrypted update
+
+          - **From:** \`${CURRENT_TAG}\`
+          - **To:** \`${NEW_TAG}@${NEW_DIGEST}\`
+          - **App version:** \`${NEW_VERSION}\`
+          - **Cooldown:** ${COOLDOWN_DAYS} days (release must be at least this old before the bot opens a PR)
+
+          ### Upstream notes
+
+          \`\`\`
+          ${RELEASE_NOTES}
+          \`\`\`
+
+          Please review the digest pin and test on Umbrel before merging. **No auto-merge.**
+          EOF
+          )
+
+          gh pr create \
+            --title "chore(scrypted): bump to ${NEW_VERSION}" \
+            --body "$BODY" \
+            --base main \
+            --head "$BRANCH"

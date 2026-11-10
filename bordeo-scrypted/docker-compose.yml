@@ -1,0 +1,68 @@
+# Scrypted on Umbrel (bordeo-scrypted)
+#
+# Host networking + app_proxy
+# ---------------------------
+# Scrypted needs network_mode: host for HomeKit mDNS / pairing (same reason
+# official Umbrel home-assistant uses host networking).
+#
+# Official host-network apps omit app_proxy and bind the manifest port on the
+# host. Community stores still declare app_proxy so umbrelOS can route the
+# Open button. Host networking means the server has no compose DNS name, and
+# 127.0.0.1 inside a 1.x app_proxy sidecar is the sidecar itself — so we point
+# APP_HOST at $GATEWAY_IP (umbrelOS exports this; typically 10.21.0.1 on
+# umbrel_main_network). That path is used by other community host-network apps
+# (e.g. MinerWatch); it is not how official home-assistant is packaged.
+#
+# Port decoupling: umbrelOS publishes the manifest port on the host for the
+# proxy. Scrypted also binds on the host, so the ports must differ or you get
+# "address already in use":
+#   * Umbrel / app_proxy (manifest port): 21080
+#   * Scrypted HTTP (SCRYPTED_INSECURE_PORT): 11080
+#   * Scrypted HTTPS (SCRYPTED_SECURE_PORT): 10443
+#
+# mDNS / HomeKit
+# --------------
+# Do NOT set SCRYPTED_DOCKER_AVAHI and do NOT stop host avahi. Leave the
+# HomeKit plugin on its default Ciao advertiser over the host network.
+# Do not mount the Docker socket (Umbrel manages updates; no Watchtower).
+
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      # Host-networked server — reach the Umbrel host via $GATEWAY_IP.
+      APP_HOST: $GATEWAY_IP
+      APP_PORT: 11080
+      PROXY_AUTH_ADD: "false"
+
+  server:
+    image: koush/scrypted:v0.147.0-noble-full@sha256:e78b4fcecdd6c61acaaf22b50ccef303c738da58cc0be57afdb116521df52296
+    restart: unless-stopped
+    network_mode: host
+    # logging is noisy and will unnecessarily wear on flash storage.
+    # scrypted has per device in memory logging that is preferred.
+    logging:
+      driver: "none"
+    environment:
+      # HTTP/HTTPS UI ports. 11080 matches denny-scrypted / upstream defaults.
+      # Manifest port 21080 is reserved for app_proxy (see header comment).
+      - SCRYPTED_INSECURE_PORT=11080
+      - SCRYPTED_SECURE_PORT=10443
+      # Prefer public DNS (matches upstream compose).
+      - SCRYPTED_DNS_SERVER_0=1.1.1.1
+      - SCRYPTED_DNS_SERVER_1=8.8.8.8
+      # Self-update / Watchtower webhooks intentionally omitted for Umbrel.
+    volumes:
+      # Same layout as denny-scrypted so data can be copied over:
+      # ~/umbrel/app-data/denny-scrypted/data/scrypted → .../bordeo-scrypted/data/scrypted
+      - ${APP_DATA_DIR}/data/scrypted:/server/volume
+    # devices: [
+    #   # hardware accelerated video decoding, opencl, etc.
+    #   "/dev/dri:/dev/dri",
+    #   # all usb devices, such as coral tpu
+    #   "/dev/bus/usb:/dev/bus/usb",
+    # ]
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
