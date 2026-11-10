@@ -1,0 +1,40 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Lint YAML
+        run: |
+          yamllint -d "{extends: relaxed, rules: {line-length: disable, document-start: disable, comments: disable}}" \
+            umbrel-app-store.yml \
+            bordeo-scrypted/umbrel-app.yml \
+            bordeo-scrypted/docker-compose.yml \
+            .github/compose.app-proxy.override.yml \
+            .github/workflows/*.yml
+
+      - name: Validate docker compose
+        env:
+          APP_DATA_DIR: /tmp/bordeo-scrypted-data
+          GATEWAY_IP: 10.21.0.1
+          DEVICE_DOMAIN_NAME: umbrel.local
+          UMBREL_ROOT: /tmp/umbrel
+        run: |
+          # Umbrel injects app_proxy's image; stub it for offline `compose config`.
+          docker compose \
+            -f bordeo-scrypted/docker-compose.yml \
+            -f .github/compose.app-proxy.override.yml \
+            config >/tmp/compose.resolved.yml
+          echo "Resolved compose OK"
+          head -n 60 /tmp/compose.resolved.yml

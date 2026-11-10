@@ -1,0 +1,5 @@
+# CI-only stub: Umbrel injects the real app_proxy image at install time.
+# docker compose config requires an image or build context for every service.
+services:
+  app_proxy:
+    image: nginx:alpine
